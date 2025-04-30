@@ -4,6 +4,10 @@ authors = []
 description = ""
 telemetry = false
 requirements = []
+[contracts.membership-registry]
+path = "contracts/membership-registry.clar"
+depends_on = []
+
 [contracts.voting-proxy]
 path = "contracts/voting-proxy.clar"
 depends_on = []
