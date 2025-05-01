@@ -16,6 +16,7 @@
 (define-constant ERR_DUPLICATE_VOTE u106)
 
 ;; Configuration Constants
+(define-constant CONTRACT_OWNER tx-sender) ;; Contract Owner
 (define-constant PROPOSAL_EXPIRATION_PERIOD u86400) ;; 24 hours in seconds
 (define-constant MAX_PROPOSAL_TITLE_LENGTH u50)
 (define-constant MAX_VOTING_POWER u1000000)
@@ -33,9 +34,9 @@
 )
 
 (define-map proposals 
-    uint 
+    uint
     {
-        title: (string-ascii MAX_PROPOSAL_TITLE_LENGTH),
+        title: (string-ascii 50),
         creator: principal,       ;; Proposal creator
         votes-for: uint,
         votes-against: uint,
@@ -126,12 +127,12 @@
 
 ;; Proposal Management
 (define-public (create-proposal 
-    (title (string-ascii MAX_PROPOSAL_TITLE_LENGTH)) 
+    (title (string-ascii 50)) 
     (expiration-blocks uint)
 )
     (begin
         ;; Authorization and input validation
-        (asserts! (is-eq tx-sender contract-owner) (err ERR_NOT_AUTHORIZED))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
         (asserts! (<= (len title) MAX_PROPOSAL_TITLE_LENGTH) (err ERR_INVALID_PROPOSAL))
         
         (let ((id (var-get proposal-count)))
