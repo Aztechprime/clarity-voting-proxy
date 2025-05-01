@@ -4,13 +4,11 @@ authors = []
 description = ""
 telemetry = false
 requirements = []
-[contracts.membership-registry]
-path = "contracts/membership-registry.clar"
+
+[contracts.proposal-trait]
+path = "contracts/proposal-trait.clar"
 depends_on = []
 
-[contracts.token-vote-power]
-path = "contracts/token-vote-power.clar"
-depends_on = []
 
 [contracts.voting-proxy]
 path = "contracts/voting-proxy.clar"

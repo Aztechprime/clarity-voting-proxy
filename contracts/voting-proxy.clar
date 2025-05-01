@@ -1,4 +1,3 @@
-```clarity
 ;; Enhanced Voting Proxy Contract
 ;; A secure and flexible voting delegation and proposal management system
 ;; Features:
@@ -27,12 +26,9 @@
 (define-constant ERR_TIMELOCK_ACTIVE u112)
 
 ;; Configuration Constants
+(define-constant CONTRACT_OWNER tx-sender)
 (define-constant PROPOSAL_EXPIRATION_PERIOD u86400) ;; 24 hours in seconds
-(define-constant MAX_PROPOSAL_TITLE_LENGTH u50)
 (define-constant MAX_VOTING_POWER u1000000)
-(define-constant MAX_CATEGORY_LENGTH u20)
-(define-constant MAX_TAGS_COUNT u5)
-(define-constant MAX_TAG_LENGTH u15)
 (define-constant TIMELOCK_PERIOD u10000) ;; Blocks before proposal execution
 (define-constant PROPOSAL_PASS_THRESHOLD u500000) ;; Minimum votes for proposal to pass
 
@@ -78,10 +74,11 @@
     }
 )
 
-(define-map proposals 
-    uint 
+(define-map UserProfiles principal { name: (string-ascii 50), age: uint, isActive: bool })
+(define-map proposals
+    uint
     {
-        title: (string-ascii MAX_PROPOSAL_TITLE_LENGTH),
+        title: (string-ascii 50),
         creator: principal,       ;; Proposal creator
         votes-for: uint,
         votes-against: uint,
@@ -90,8 +87,8 @@
         created-at: uint,         ;; Proposal creation timestamp
         active: bool,
         expires-at: uint,         ;; Proposal expiration timestamp
-        category: (string-ascii MAX_CATEGORY_LENGTH),
-        tags: (list MAX_TAGS_COUNT (string-ascii MAX_TAG_LENGTH)),
+        category: (string-ascii 20),
+        tags: (list 5 (string-ascii 15)),
         voting-mode: uint,        ;; Standard or quadratic voting
         executable: (optional principal),  ;; Contract to call if proposal passes
         function-name: (optional (string-ascii 128)),  ;; Function to call
@@ -160,15 +157,24 @@
     )
 )
 
+;; Helper function for absolute difference (since there's no abs function)
+(define-private (abs-diff (a uint) (b uint))
+    (if (>= a b)
+        (- a b)
+        (- b a)
+    )
+)
+
+;; Update the quadratic voting power function to use our internal sqrt
 (define-private (calculate-quadratic-voting-power (base-power uint))
-    (to-uint (contract-call? .math-utils sqrt (to-int base-power)))
+    (sqrti base-power)
 )
 
 ;; Public Functions for Membership Management
 (define-public (set-member-tier (member principal) (tier uint))
     (begin
         ;; Only contract owner can set tiers
-        (asserts! (is-eq tx-sender contract-owner) (err ERR_NOT_AUTHORIZED))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
         (asserts! (<= tier TIER_PLATINUM) (err ERR_INVALID_MEMBERSHIP_TIER))
         
         (map-set member-tiers member {
@@ -182,21 +188,26 @@
 
 (define-public (set-custom-voting-weight (member principal) (weight uint))
     (begin
-        (asserts! (is-eq tx-sender contract-owner) (err ERR_NOT_AUTHORIZED))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
         (asserts! (< weight MAX_VOTING_POWER) (err ERR_INVALID_VOTING_WEIGHT))
         
-        (match (map-get? member-tiers member)
-            member-data
-            (map-set member-tiers member (merge member-data { voting-weight: weight }))
-            (err ERR_INVALID_MEMBERSHIP_TIER)
+        (let ((member-data (map-get? member-tiers member)))
+            (if (is-some member-data)
+                (begin
+                    (map-set member-tiers member 
+                        (merge (unwrap-panic member-data) { voting-weight: weight })
+                    )
+                    (ok true)
+                )
+                (err ERR_INVALID_MEMBERSHIP_TIER)
+            )
         )
-        (ok true)
     )
 )
 
 (define-public (configure-token-voting (token-contract principal) (enabled bool) (weight-multiplier uint))
     (begin
-        (asserts! (is-eq tx-sender contract-owner) (err ERR_NOT_AUTHORIZED))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
         (asserts! (< weight-multiplier MAX_VOTING_POWER) (err ERR_INVALID_VOTING_WEIGHT))
         
         (map-set token-voting-config token-contract {
@@ -246,18 +257,18 @@
 
 ;; Proposal Management
 (define-public (create-proposal 
-    (title (string-ascii MAX_PROPOSAL_TITLE_LENGTH)) 
+    (title (string-ascii 50)) 
     (expiration-blocks uint)
-    (category (string-ascii MAX_CATEGORY_LENGTH))
-    (tags (list MAX_TAGS_COUNT (string-ascii MAX_TAG_LENGTH)))
+    (category (string-ascii 20))
+    (tags (list 5 (string-ascii 15)))
     (voting-mode uint)
     (executable (optional principal))
     (function-name (optional (string-ascii 128)))
 )
     (begin
         ;; Authorization and input validation
-        (asserts! (is-eq tx-sender contract-owner) (err ERR_NOT_AUTHORIZED))
-        (asserts! (<= (len title) MAX_PROPOSAL_TITLE_LENGTH) (err ERR_INVALID_PROPOSAL))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
+        (asserts! (<= (len title) u50) (err ERR_INVALID_PROPOSAL))
         (asserts! (or (is-eq voting-mode VOTING_MODE_STANDARD) (is-eq voting-mode VOTING_MODE_QUADRATIC)) (err ERR_INVALID_PROPOSAL))
         
         (let (
@@ -342,39 +353,6 @@
     )
 )
 
-(define-public (execute-proposal (proposal-id uint))
-    (let (
-        (proposal (unwrap! (map-get? proposals proposal-id) (err ERR_INVALID_PROPOSAL)))
-    )
-        ;; Check if the proposal passed
-        (asserts! (>= (get votes-for proposal) PROPOSAL_PASS_THRESHOLD) (err ERR_PROPOSAL_NOT_PASSED))
-        
-        ;; Check if it's executable
-        (asserts! (and (is-some (get executable proposal)) (is-some (get function-name proposal))) (err ERR_INVALID_PROPOSAL))
-        
-        ;; Check if already executed
-        (asserts! (not (get executed proposal)) (err ERR_INVALID_PROPOSAL))
-        
-        ;; Check timelock
-        (asserts! (>= block-height (get timelock-until proposal)) (err ERR_TIMELOCK_ACTIVE))
-        
-        ;; Only contract owner can execute
-        (asserts! (is-eq tx-sender contract-owner) (err ERR_NOT_AUTHORIZED))
-        
-        ;; Execute the proposal
-        (let (
-            (target-contract (unwrap-panic (get executable proposal)))
-            (function (unwrap-panic (get function-name proposal)))
-            (result (contract-call? target-contract function proposal-id))
-        )
-            ;; Mark as executed
-            (map-set proposals proposal-id (merge proposal { executed: true }))
-            
-            ;; Return the execution result
-            (ok result)
-        )
-    )
-)
 
 ;; Read-only Functions
 (define-read-only (get-delegation-details (voter principal))
@@ -414,4 +392,3 @@
         )
     )
 )
-```
