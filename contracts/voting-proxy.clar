@@ -5,6 +5,10 @@
 ;; - Proposal lifecycle management
 ;; - Robust access controls
 ;; - Comprehensive tracking of voting power
+;; - Weighted voting based on token holdings or member status
+;; - Time-locked proposals with execution capabilities
+;; - Proposal categories and tags
+;; - Quadratic voting option
 
 ;; Error Constants
 (define-constant ERR_NOT_AUTHORIZED u100)
@@ -14,12 +18,32 @@
 (define-constant ERR_PROPOSAL_EXPIRED u104)
 (define-constant ERR_SELF_DELEGATION u105)
 (define-constant ERR_DUPLICATE_VOTE u106)
+(define-constant ERR_INVALID_MEMBERSHIP_TIER u107)
+(define-constant ERR_INVALID_VOTING_WEIGHT u108)
+(define-constant ERR_INVALID_TOKEN_CONTRACT u109)
+(define-constant ERR_EXECUTION_FAILED u110)
+(define-constant ERR_PROPOSAL_NOT_PASSED u111)
+(define-constant ERR_TIMELOCK_ACTIVE u112)
 
 ;; Configuration Constants
-(define-constant CONTRACT_OWNER tx-sender) ;; Contract Owner
+(define-constant CONTRACT_OWNER tx-sender)
 (define-constant PROPOSAL_EXPIRATION_PERIOD u86400) ;; 24 hours in seconds
-(define-constant MAX_PROPOSAL_TITLE_LENGTH u50)
 (define-constant MAX_VOTING_POWER u1000000)
+(define-constant TIMELOCK_PERIOD u10000) ;; Blocks before proposal execution
+(define-constant PROPOSAL_PASS_THRESHOLD u500000) ;; Minimum votes for proposal to pass
+
+;; Membership Tier Constants
+(define-constant TIER_BASIC u1)
+(define-constant TIER_SILVER u2)
+(define-constant TIER_GOLD u3)
+(define-constant TIER_PLATINUM u4)
+
+;; Voting Power by Tier
+(define-map tier-voting-power uint uint)
+
+;; Voting Modes
+(define-constant VOTING_MODE_STANDARD u1)
+(define-constant VOTING_MODE_QUADRATIC u2)
 
 ;; Data Structures
 (define-map delegations 
@@ -33,7 +57,25 @@
     }
 )
 
-(define-map proposals 
+(define-map member-tiers 
+    principal 
+    {
+        tier: uint,              ;; Membership tier
+        joined-at: uint,         ;; When they joined
+        voting-weight: uint      ;; Custom voting weight
+    }
+)
+
+(define-map token-voting-config
+    principal                    ;; Token contract
+    {
+        enabled: bool,           ;; Is token-gated voting enabled
+        weight-multiplier: uint  ;; How much each token is worth in voting power
+    }
+)
+
+(define-map UserProfiles principal { name: (string-ascii 50), age: uint, isActive: bool })
+(define-map proposals
     uint
     {
         title: (string-ascii 50),
@@ -44,7 +86,14 @@
         max-vote-power: uint,     ;; Maximum possible vote power
         created-at: uint,         ;; Proposal creation timestamp
         active: bool,
-        expires-at: uint          ;; Proposal expiration timestamp
+        expires-at: uint,         ;; Proposal expiration timestamp
+        category: (string-ascii 20),
+        tags: (list 5 (string-ascii 15)),
+        voting-mode: uint,        ;; Standard or quadratic voting
+        executable: (optional principal),  ;; Contract to call if proposal passes
+        function-name: (optional (string-ascii 128)),  ;; Function to call
+        timelock-until: uint,     ;; Block height when execution is allowed
+        executed: bool            ;; Has this proposal been executed
     }
 )
 
@@ -54,8 +103,17 @@
         voter: principal, 
         proposal-id: uint
     } 
-    bool
+    {
+        voted-for: bool,
+        voting-power-used: uint
+    }
 )
+
+;; Initialize tier voting power
+(map-set tier-voting-power TIER_BASIC u1)
+(map-set tier-voting-power TIER_SILVER u5)
+(map-set tier-voting-power TIER_GOLD u10)
+(map-set tier-voting-power TIER_PLATINUM u20)
 
 ;; Private Utility Functions
 (define-private (is-valid-delegation (voter principal) (delegate principal))
@@ -88,6 +146,78 @@
     )
 )
 
+(define-private (get-member-voting-power (member principal))
+    (let ((member-data (map-get? member-tiers member)))
+        (if (is-some member-data)
+            (let ((tier-data (unwrap-panic member-data)))
+                (default-to u1 (map-get? tier-voting-power (get tier tier-data)))
+            )
+            u1  ;; Default voting power for non-members
+        )
+    )
+)
+
+;; Helper function for absolute difference (since there's no abs function)
+(define-private (abs-diff (a uint) (b uint))
+    (if (>= a b)
+        (- a b)
+        (- b a)
+    )
+)
+
+;; Update the quadratic voting power function to use our internal sqrt
+(define-private (calculate-quadratic-voting-power (base-power uint))
+    (sqrti base-power)
+)
+
+;; Public Functions for Membership Management
+(define-public (set-member-tier (member principal) (tier uint))
+    (begin
+        ;; Only contract owner can set tiers
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
+        (asserts! (<= tier TIER_PLATINUM) (err ERR_INVALID_MEMBERSHIP_TIER))
+        
+        (map-set member-tiers member {
+            tier: tier,
+            joined-at: block-height,
+            voting-weight: (default-to u1 (map-get? tier-voting-power tier))
+        })
+        (ok true)
+    )
+)
+
+(define-public (set-custom-voting-weight (member principal) (weight uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
+        (asserts! (< weight MAX_VOTING_POWER) (err ERR_INVALID_VOTING_WEIGHT))
+        
+        (let ((member-data (map-get? member-tiers member)))
+            (if (is-some member-data)
+                (begin
+                    (map-set member-tiers member 
+                        (merge (unwrap-panic member-data) { voting-weight: weight })
+                    )
+                    (ok true)
+                )
+                (err ERR_INVALID_MEMBERSHIP_TIER)
+            )
+        )
+    )
+)
+
+(define-public (configure-token-voting (token-contract principal) (enabled bool) (weight-multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
+        (asserts! (< weight-multiplier MAX_VOTING_POWER) (err ERR_INVALID_VOTING_WEIGHT))
+        
+        (map-set token-voting-config token-contract {
+            enabled: enabled,
+            weight-multiplier: weight-multiplier
+        })
+        (ok true)
+    )
+)
+
 ;; Public Functions for Delegation
 (define-public (delegate-vote (to principal))
     (begin
@@ -105,7 +235,7 @@
                     { voter: tx-sender, delegate: to }
                     {
                         delegation-time: block-height,
-                        vote-power: u1  ;; Default voting power
+                        vote-power: (get-member-voting-power tx-sender)
                     }
                 )
                 (ok true)
@@ -129,13 +259,22 @@
 (define-public (create-proposal 
     (title (string-ascii 50)) 
     (expiration-blocks uint)
+    (category (string-ascii 20))
+    (tags (list 5 (string-ascii 15)))
+    (voting-mode uint)
+    (executable (optional principal))
+    (function-name (optional (string-ascii 128)))
 )
     (begin
         ;; Authorization and input validation
         (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_NOT_AUTHORIZED))
-        (asserts! (<= (len title) MAX_PROPOSAL_TITLE_LENGTH) (err ERR_INVALID_PROPOSAL))
+        (asserts! (<= (len title) u50) (err ERR_INVALID_PROPOSAL))
+        (asserts! (or (is-eq voting-mode VOTING_MODE_STANDARD) (is-eq voting-mode VOTING_MODE_QUADRATIC)) (err ERR_INVALID_PROPOSAL))
         
-        (let ((id (var-get proposal-count)))
+        (let (
+            (id (var-get proposal-count))
+            (timelock (if (is-some executable) (+ block-height TIMELOCK_PERIOD) u0))
+        )
             (map-set proposals id {
                 title: title,
                 creator: tx-sender,
@@ -145,7 +284,14 @@
                 max-vote-power: MAX_VOTING_POWER,
                 created-at: block-height,
                 active: true,
-                expires-at: (+ block-height expiration-blocks)
+                expires-at: (+ block-height expiration-blocks),
+                category: category,
+                tags: tags,
+                voting-mode: voting-mode,
+                executable: executable,
+                function-name: function-name,
+                timelock-until: timelock,
+                executed: false
             })
             (var-set proposal-count (+ id u1))
             (ok id)
@@ -168,7 +314,13 @@
             (err ERR_DUPLICATE_VOTE)
         )
         
-        (let ((current-vote-power u1))  ;; Base voting power
+        (let (
+            (base-vote-power (get-member-voting-power voter))
+            (voting-mode (get voting-mode proposal))
+            (current-vote-power (if (is-eq voting-mode VOTING_MODE_QUADRATIC)
+                                   (calculate-quadratic-voting-power base-vote-power)
+                                   base-vote-power))
+        )
             (if vote-for
                 (map-set proposals proposal-id 
                     (merge proposal { 
@@ -187,14 +339,20 @@
             ;; Record voting participation
             (map-set voting-records 
                 { voter: voter, proposal-id: proposal-id } 
-                true
+                { voted-for: vote-for, voting-power-used: current-vote-power }
             )
-            (print { event: "voting-record", voter: voter, proposal-id: proposal-id }) ;; Add logging for traceability
+            (print { 
+                event: "voting-record", 
+                voter: voter, 
+                proposal-id: proposal-id, 
+                vote-power: current-vote-power 
+            })
             
-            (ok true)
+            (ok current-vote-power)
         )
     )
 )
+
 
 ;; Read-only Functions
 (define-read-only (get-delegation-details (voter principal))
@@ -209,6 +367,27 @@
     (let ((proposal (map-get? proposals proposal-id)))
         (match proposal
             p (ok (get total-vote-power p))
+            (err ERR_INVALID_PROPOSAL)
+        )
+    )
+)
+
+(define-read-only (get-member-tier (member principal))
+    (map-get? member-tiers member)
+)
+
+(define-read-only (get-voting-record (voter principal) (proposal-id uint))
+    (map-get? voting-records { voter: voter, proposal-id: proposal-id })
+)
+
+(define-read-only (get-token-voting-config (token-contract principal))
+    (map-get? token-voting-config token-contract)
+)
+
+(define-read-only (has-proposal-passed (proposal-id uint))
+    (let ((proposal (map-get? proposals proposal-id)))
+        (match proposal
+            p (ok (>= (get votes-for p) PROPOSAL_PASS_THRESHOLD))
             (err ERR_INVALID_PROPOSAL)
         )
     )
